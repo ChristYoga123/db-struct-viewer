@@ -158,28 +158,6 @@ class ShowDbStructureCommand extends Command
             );
         }
 
-        // $foreignKeys = $this->getTableIndexes($tableName);
-        // if (!empty($foreignKeys)) {
-        //     $this->newLine();
-        //     $this->info('Foreign Keys:');
-        //     $fkData = [];
-            
-        //     foreach ($foreignKeys as $fk) {
-        //         $fkData[] = [
-        //             'Name' => $fk->CONSTRAINT_NAME,
-        //             'Column' => $fk->COLUMN_NAME,
-        //             'References' => $fk->REFERENCED_TABLE_NAME . '(' . $fk->REFERENCED_COLUMN_NAME . ')',
-        //             'On Delete' => $fk->DELETE_RULE,
-        //             'On Update' => $fk->UPDATE_RULE,
-        //         ];
-        //     }
-            
-        //     $this->table(
-        //         ['Name', 'Column', 'References', 'On Delete', 'On Update'],
-        //         $fkData
-        //     );
-        // }
-
         if ($showMigrations) {
             $this->newLine();
             $this->showRelatedMigrations($tableName);
@@ -200,27 +178,32 @@ class ShowDbStructureCommand extends Command
             return;
         }
 
-        $migrations = File::files($migrationPath);
-		$relatedMigrations = [];
+        $migrations = File::allFiles($migrationPath);
+        $relatedMigrations = [];
 
-		foreach ($migrations as $migration) {
-			$filename = $migration->getFilename();
-			$content = File::get($migration->getPathname());
-			
-			if ($this->migrationReferencesTable($content, $tableName)) {
-				$relatedMigrations[] = [
-					'file' => $filename,
-					'path' => $migration->getPathname(),
-					'type' => $this->detectMigrationType($filename, $content, $tableName),
-					'content' => $content,
-				];
-			}
-		}
+        foreach ($migrations as $migration) {
+            $filename = $migration->getFilename();
+            $content = File::get($migration->getPathname());
+            
+            if ($this->migrationReferencesTable($content, $tableName)) {
+                $relatedMigrations[] = [
+                    'file' => $filename,
+                    'path' => $migration->getPathname(),
+                    'type' => $this->detectMigrationType($content, $tableName),
+                    'content' => $content,
+                ];
+            }
+        }
 
         if (empty($relatedMigrations)) {
             $this->warn("No migrations found for table '{$tableName}'");
             return;
         }
+
+        // Sort migrations by filename (chronological order)
+        usort($relatedMigrations, function($a, $b) {
+            return strcmp($a['file'], $b['file']);
+        });
 
         foreach ($relatedMigrations as $index => $migration) {
             $this->line(($index + 1) . '. ' . $migration['file']);
@@ -244,50 +227,98 @@ class ShowDbStructureCommand extends Command
         }
     }
 
-	protected function detectMigrationType($filename, $content, $tableName = null)
+    /**
+     * Detect migration type based on content analysis
+     */
+    protected function detectMigrationType($content, $tableName)
     {
-		if ($tableName !== null) {
-			$patternCreate = "/Schema::create\(\s*['\"]" . preg_quote($tableName, '/') . "['\"]\s*\)/";
-			if (preg_match($patternCreate, $content)) {
-				return '🆕 Create Table';
-			}
-		}
-
-		if (Str::contains($filename, 'create_')) {
+        $quoted = preg_quote($tableName, '/');
+        
+        // Check for Schema::create
+        if (preg_match("/Schema\s*::\s*create\s*\(\s*['\"]" . $quoted . "['\"]/i", $content)) {
             return '🆕 Create Table';
-        } elseif (Str::contains($filename, ['add_', 'adding_'])) {
-            return '➕ Add Column(s)';
-        } elseif (Str::contains($filename, ['remove_', 'drop_', 'delete_'])) {
-            return '➖ Remove Column(s)';
-        } elseif (Str::contains($filename, ['modify_', 'change_', 'alter_'])) {
-            return '✏️ Modify Column(s)';
-        } elseif (Str::contains($filename, 'rename_')) {
-            return '🔄 Rename';
         }
-
-        return '🔧 Modify';
+        
+        // Check for Schema::table (alter/modify)
+        if (preg_match("/Schema\s*::\s*table\s*\(\s*['\"]" . $quoted . "['\"]/i", $content)) {
+            // Try to detect specific alter type
+            if (preg_match('/\$table\s*->\s*drop(Column|Foreign|Index|Primary|Unique)/i', $content)) {
+                return '➖ Drop Column/Key';
+            }
+            if (preg_match('/\$table\s*->\s*rename(Column|Index)/i', $content)) {
+                return '🔄 Rename Column/Index';
+            }
+            if (preg_match('/\$table\s*->\s*(string|integer|text|boolean|date|timestamp|json|decimal|float|bigInteger|foreignId|foreign)\s*\(/i', $content)) {
+                return '➕ Add Column(s)';
+            }
+            if (preg_match('/\$table\s*->\s*(change|modify)/i', $content)) {
+                return '✏️ Modify Column(s)';
+            }
+            return '🔧 Alter Table';
+        }
+        
+        // Check for Schema::dropIfExists or Schema::drop
+        if (preg_match("/Schema\s*::\s*(dropIfExists|drop)\s*\(\s*['\"]" . $quoted . "['\"]/i", $content)) {
+            return '🗑️ Drop Table';
+        }
+        
+        // Check for Schema::rename
+        if (preg_match("/Schema\s*::\s*rename\s*\(\s*['\"]" . $quoted . "['\"]/i", $content)) {
+            return '🔄 Rename Table';
+        }
+        
+        // Check for raw SQL
+        if (preg_match("/DB\s*::\s*(statement|unprepared)/i", $content)) {
+            return '⚙️ Raw SQL';
+        }
+        
+        return '🔧 Other';
     }
 
-	/**
-	 * Check if a migration file content references the exact table via Schema facade.
-	 */
-	protected function migrationReferencesTable(string $content, string $tableName): bool
-	{
-		$quoted = preg_quote($tableName, '/');
-		$patterns = [
-			"/Schema::create\(\s*['\"]{$quoted}['\"]\s*\)/",
-			"/Schema::table\(\s*['\"]{$quoted}['\"]\s*\)/",
-			"/Schema::dropIfExists\(\s*['\"]{$quoted}['\"]\s*\)/",
-		];
-
-		foreach ($patterns as $pattern) {
-			if (preg_match($pattern, $content)) {
-				return true;
-			}
-		}
-
-		return false;
-	}
+    /**
+     * Check if migration content references the exact table
+     */
+    protected function migrationReferencesTable(string $content, string $tableName): bool
+    {
+        $quoted = preg_quote($tableName, '/');
+        
+        // Pattern untuk Schema::create
+        if (preg_match("/Schema\s*::\s*create\s*\(\s*['\"]" . $quoted . "['\"]\s*,/i", $content)) {
+            return true;
+        }
+        
+        // Pattern untuk Schema::table
+        if (preg_match("/Schema\s*::\s*table\s*\(\s*['\"]" . $quoted . "['\"]\s*,/i", $content)) {
+            return true;
+        }
+        
+        // Pattern untuk Schema::dropIfExists atau Schema::drop
+        if (preg_match("/Schema\s*::\s*(dropIfExists|drop)\s*\(\s*['\"]" . $quoted . "['\"][\s,\)]/i", $content)) {
+            return true;
+        }
+        
+        // Pattern untuk Schema::rename
+        if (preg_match("/Schema\s*::\s*rename\s*\(\s*['\"]" . $quoted . "['\"][\s,]/i", $content)) {
+            return true;
+        }
+        
+        // Pattern untuk FQCN Illuminate\Support\Facades\Schema
+        if (preg_match("/Illuminate\\\\Support\\\\Facades\\\\Schema\s*::\s*(create|table|dropIfExists|drop|rename)\s*\(\s*['\"]" . $quoted . "['\"][\s,\)]/i", $content)) {
+            return true;
+        }
+        
+        // Pattern untuk raw SQL dengan DB facade
+        if (preg_match("/DB\s*::\s*(?:statement|unprepared)\s*\(['\"][^'\"]*\b(CREATE|ALTER|DROP)\s+TABLE\s+[`\"]?" . $quoted . "[`\"]?/i", $content)) {
+            return true;
+        }
+        
+        // Pattern untuk FQCN DB facade
+        if (preg_match("/Illuminate\\\\Support\\\\Facades\\\\DB\s*::\s*(?:statement|unprepared)\s*\(['\"][^'\"]*\b(CREATE|ALTER|DROP)\s+TABLE\s+[`\"]?" . $quoted . "[`\"]?/i", $content)) {
+            return true;
+        }
+        
+        return false;
+    }
 
     protected function getAllTables()
     {
