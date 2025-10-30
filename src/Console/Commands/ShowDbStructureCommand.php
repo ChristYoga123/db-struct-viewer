@@ -201,35 +201,21 @@ class ShowDbStructureCommand extends Command
         }
 
         $migrations = File::files($migrationPath);
-        $relatedMigrations = [];
+		$relatedMigrations = [];
 
-        $searchPatterns = [
-            "create_{$tableName}_table",
-            "create_" . Str::singular($tableName) . "_table",
-            "_to_{$tableName}_table",
-            "_to_" . Str::singular($tableName) . "_table",
-            "_in_{$tableName}_table",
-            "_in_" . Str::singular($tableName) . "_table",
-            "_{$tableName}_",
-            "_" . Str::singular($tableName) . "_",
-        ];
-
-        foreach ($migrations as $migration) {
-            $filename = $migration->getFilename();
-            
-            foreach ($searchPatterns as $pattern) {
-                if (Str::contains($filename, $pattern)) {
-                    $content = File::get($migration->getPathname());
-                    $relatedMigrations[] = [
-                        'file' => $filename,
-                        'path' => $migration->getPathname(),
-                        'type' => $this->detectMigrationType($filename, $content),
-                        'content' => $content,
-                    ];
-                    break;
-                }
-            }
-        }
+		foreach ($migrations as $migration) {
+			$filename = $migration->getFilename();
+			$content = File::get($migration->getPathname());
+			
+			if ($this->migrationReferencesTable($content, $tableName)) {
+				$relatedMigrations[] = [
+					'file' => $filename,
+					'path' => $migration->getPathname(),
+					'type' => $this->detectMigrationType($filename, $content, $tableName),
+					'content' => $content,
+				];
+			}
+		}
 
         if (empty($relatedMigrations)) {
             $this->warn("No migrations found for table '{$tableName}'");
@@ -258,9 +244,16 @@ class ShowDbStructureCommand extends Command
         }
     }
 
-    protected function detectMigrationType($filename, $content)
+	protected function detectMigrationType($filename, $content, $tableName = null)
     {
-        if (Str::contains($filename, 'create_')) {
+		if ($tableName !== null) {
+			$patternCreate = "/Schema::create\(\s*['\"]" . preg_quote($tableName, '/') . "['\"]\s*\)/";
+			if (preg_match($patternCreate, $content)) {
+				return '🆕 Create Table';
+			}
+		}
+
+		if (Str::contains($filename, 'create_')) {
             return '🆕 Create Table';
         } elseif (Str::contains($filename, ['add_', 'adding_'])) {
             return '➕ Add Column(s)';
@@ -274,6 +267,27 @@ class ShowDbStructureCommand extends Command
 
         return '🔧 Modify';
     }
+
+	/**
+	 * Check if a migration file content references the exact table via Schema facade.
+	 */
+	protected function migrationReferencesTable(string $content, string $tableName): bool
+	{
+		$quoted = preg_quote($tableName, '/');
+		$patterns = [
+			"/Schema::create\(\s*['\"]{$quoted}['\"]\s*\)/",
+			"/Schema::table\(\s*['\"]{$quoted}['\"]\s*\)/",
+			"/Schema::dropIfExists\(\s*['\"]{$quoted}['\"]\s*\)/",
+		];
+
+		foreach ($patterns as $pattern) {
+			if (preg_match($pattern, $content)) {
+				return true;
+			}
+		}
+
+		return false;
+	}
 
     protected function getAllTables()
     {
